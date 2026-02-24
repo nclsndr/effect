@@ -28,6 +28,7 @@ jobs:
       - name: Label based on file changes
         uses: ./.github/actions/pr-label
         with:
+          github-token: ${{ github.token }}
           rules: |
             [
               { "label": "db-migration", "anyChanged": ["packages/database/src/postgres/drizzle/"] }

@@ -4,7 +4,6 @@ inputs:
   github-token:
     description: GitHub token used to read PR files and apply labels.
     required: true
-    default: ${{ github.token }}
   rules:
     description: >
       JSON array of rules. Each rule: {"label": string, "anyChanged": string[]}.
