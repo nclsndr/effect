@@ -1,0 +1,171 @@
+name: PR-label
+description: Apply labels to pull requests based on changed files.
+inputs:
+  github-token:
+    description: GitHub token used to read PR files and apply labels.
+    required: true
+    default: ${{ github.token }}
+  rules:
+    description: >
+      JSON array of rules. Each rule: {"label": string, "anyChanged": string[]}.
+      anyChanged entries are path prefixes matched against PR changed filenames.
+    required: true
+  remove-unmatched:
+    description: Remove rule labels when they no longer match.
+    required: false
+    default: "false"
+  debug:
+    description: Enable verbose logging.
+    required: false
+    default: "false"
+outputs:
+  matched-labels:
+    description: JSON array of labels that matched and were considered for application.
+  added-labels:
+    description: JSON array of labels that were added.
+  removed-labels:
+    description: JSON array of labels that were removed.
+
+runs:
+  using: composite
+  steps:
+    - name: Apply labels
+      uses: actions/github-script@v8
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const rulesRaw = core.getInput('rules', { required: true });
+          const removeUnmatchedRaw = core.getInput('remove-unmatched');
+          const debugRaw = core.getInput('debug');
+
+          const removeUnmatched = removeUnmatchedRaw === 'true';
+          const debug = debugRaw === 'true';
+
+          const pullRequest = context.payload.pull_request;
+          if (pullRequest === undefined || pullRequest === null) {
+            core.setFailed(`Unsupported event: missing pull_request payload (event: ${context.eventName})`);
+            return;
+          }
+
+          const owner = context.repo.owner;
+          const repo = context.repo.repo;
+          const pull_number = pullRequest.number;
+
+          let rules;
+          try {
+            rules = JSON.parse(rulesRaw);
+          } catch (e) {
+            core.setFailed(`Invalid JSON in input "rules": ${e instanceof Error ? e.message : String(e)}`);
+            return;
+          }
+
+          if (Array.isArray(rules) === false) {
+            core.setFailed('Input "rules" must be a JSON array.');
+            return;
+          }
+
+          /** @type {Array<{ label: string; anyChanged: string[] }>} */
+          const normalizedRules = [];
+          for (const rule of rules) {
+            if (typeof rule !== 'object' || rule === null) {
+              core.setFailed('Each rule must be an object.');
+              return;
+            }
+            if (typeof rule.label !== 'string') {
+              core.setFailed('Each rule must have a string "label".');
+              return;
+            }
+            if (Array.isArray(rule.anyChanged) === false) {
+              core.setFailed(`Rule "${rule.label}" must have an array "anyChanged".`);
+              return;
+            }
+            const anyChanged = rule.anyChanged.filter((p) => typeof p === 'string');
+            if (anyChanged.length !== rule.anyChanged.length) {
+              core.setFailed(`Rule "${rule.label}" has non-string entries in "anyChanged".`);
+              return;
+            }
+            if (anyChanged.length === 0) {
+              core.setFailed(`Rule "${rule.label}" must have at least one entry in "anyChanged".`);
+              return;
+            }
+            normalizedRules.push({ label: rule.label, anyChanged });
+          }
+
+          const files = await github.paginate(
+            github.rest.pulls.listFiles,
+            { owner, repo, pull_number, per_page: 100 }
+          );
+
+          /** @type {string[]} */
+          const changedFiles = [];
+          for (const f of files) {
+            if (f && typeof f.filename === 'string') {
+              changedFiles.push(f.filename);
+            }
+          }
+
+          if (debug === true) {
+            core.info(`PR #${pull_number} changed files (${changedFiles.length}):`);
+            for (const file of changedFiles) core.info(`- ${file}`);
+          }
+
+          const existingLabelNames = Array.isArray(pullRequest.labels)
+            ? pullRequest.labels
+                .map((l) => (l && typeof l.name === 'string' ? l.name : null))
+                .filter((n) => typeof n === 'string')
+            : [];
+
+          /** @type {Set<string>} */
+          const matchedLabels = new Set();
+          for (const rule of normalizedRules) {
+            let matched = false;
+            for (const prefix of rule.anyChanged) {
+              if (typeof prefix !== 'string') continue;
+              matched = changedFiles.some((file) => file.startsWith(prefix) === true);
+              if (matched === true) break;
+            }
+            if (matched === true) matchedLabels.add(rule.label);
+          }
+
+          const labelsToAdd = Array.from(matchedLabels).filter(
+            (label) => existingLabelNames.includes(label) === false
+          );
+
+          /** @type {string[]} */
+          let labelsRemoved = [];
+          if (removeUnmatched === true) {
+            const ruleLabels = normalizedRules.map((r) => r.label);
+            const labelsToRemove = ruleLabels.filter(
+              (label) =>
+                matchedLabels.has(label) === false && existingLabelNames.includes(label) === true
+            );
+
+            for (const name of labelsToRemove) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: pull_number,
+                  name,
+                });
+                labelsRemoved.push(name);
+              } catch (e) {
+                if (debug === true) {
+                  core.info(`Failed to remove label "${name}": ${e instanceof Error ? e.message : String(e)}`);
+                }
+              }
+            }
+          }
+
+          if (labelsToAdd.length > 0) {
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: pull_number,
+              labels: labelsToAdd,
+            });
+          }
+
+          core.setOutput('matched-labels', JSON.stringify(Array.from(matchedLabels).sort()));
+          core.setOutput('added-labels', JSON.stringify(labelsToAdd.sort()));
+          core.setOutput('removed-labels', JSON.stringify(labelsRemoved.sort()));
